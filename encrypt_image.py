@@ -1,170 +1,145 @@
-
-import base64
-import io
 import json
 import os
-from pathlib import Path
-from urllib.parse import unquote
-from .core.core import get_sha256,dencrypt_image,dencrypt_image_v2,encrypt_image_v2
-from PIL import PngImagePlugin,_util,ImagePalette
-from PIL import Image as PILImage
-from io import BytesIO
-from typing import Optional
-import sys
+import re
+import time
+
 import folder_paths
-from comfy.cli_args import args
-
-from PIL import Image
-from PIL.PngImagePlugin import PngInfo
-
 import numpy as np
+import torch
+from PIL import Image, PngImagePlugin
 
-_password = '123qwe'
+from .core.core import decrypt_image_v2, encrypt_image_v2
 
-            
-if PILImage.Image.__name__ != 'EncryptedImage':
-    
-    super_open = PILImage.open
-    
-    class EncryptedImage(PILImage.Image):
-        __name__ = "EncryptedImage"
-        @staticmethod
-        def from_image(image:PILImage.Image):
-            image = image.copy()
-            img = EncryptedImage()
-            img.im = image.im
-            img._mode = image.im.mode
-            if image.im.mode:
-                try:
-                    img.mode = image.im.mode
-                except Exception as e:
-                    ''
-            img._size = image.size
-            img.format = image.format
-            if image.mode in ("P", "PA"):
-                if image.palette:
-                    img.palette = image.palette.copy()
-                else:
-                    img.palette = ImagePalette.ImagePalette()
-            img.info = image.info.copy()
-            return img
-            
-        def save(self, fp, format=None, **params):
-            filename = ""
-            if isinstance(fp, Path):
-                filename = str(fp)
-            elif _util.is_path(fp):
-                filename = fp
-            elif fp == sys.stdout:
-                try:
-                    fp = sys.stdout.buffer
-                except AttributeError:
-                    pass
-            if not filename and hasattr(fp, "name") and _util.is_path(fp.name):
-                # only set the name for metadata purposes
-                filename = fp.name
-            
-            if not filename or not _password:
-                # 如果没有密码或不保存到硬盘，直接保存
-                super().save(fp, format = format, **params)
-                return
-            
-            if 'Encrypt' in self.info and (self.info['Encrypt'] == 'pixel_shuffle' or self.info['Encrypt'] == 'pixel_shuffle_2'):
-                super().save(fp, format = format, **params)
-                return
-            
-            encrypt_image_v2(self, get_sha256(_password))
-            self.format = PngImagePlugin.PngImageFile.format
-            pnginfo = params.get('pnginfo', PngImagePlugin.PngInfo())
-            if not pnginfo:
-                pnginfo = PngImagePlugin.PngInfo()
-                for key in (self.info or {}).keys():
-                    if self.info[key]:
-                        pnginfo.add_text(key,str(self.info[key]))
-            pnginfo.add_text('Encrypt', 'pixel_shuffle_2')
-            pnginfo.add_text('EncryptPwdSha', get_sha256(f'{get_sha256(_password)}Encrypt'))
-            params.update(pnginfo=pnginfo)
-            super().save(fp, format=self.format, **params)
-            # 保存到文件后解密内存内的图片，让直接在内存内使用时图片正常
-            dencrypt_image_v2(self, get_sha256(_password)) 
-            
-    def open(fp,*args, **kwargs):
-        image = super_open(fp,*args, **kwargs)
-        if _password and image.format.lower() == PngImagePlugin.PngImageFile.format.lower():
-            pnginfo = image.info or {}
-            if 'Encrypt' in pnginfo and pnginfo["Encrypt"] == 'pixel_shuffle':
-                dencrypt_image(image, get_sha256(_password))
-                pnginfo["Encrypt"] = None
-                image = EncryptedImage.from_image(image=image)
-                return image
-            if 'Encrypt' in pnginfo and pnginfo["Encrypt"] == 'pixel_shuffle_2':
-                dencrypt_image_v2(image, get_sha256(_password))
-                pnginfo["Encrypt"] = None
-                image = EncryptedImage.from_image(image=image)
-                return image
-        return EncryptedImage.from_image(image=image)
+def _sanitize_name(value: str, fallback: str = "Encrypted"):
+    value = (value or "").strip()
+    value = re.sub(r'[\\/:*?"<>|\r\n\t]+', "_", value)
+    value = re.sub(r"\s+", "_", value)
+    value = value.strip("._ ")
+    return value or fallback
 
-    # if _password:
-    PILImage.Image = EncryptedImage
-    PILImage.open = open
-    
-    print('图片加密插件加载成功')
+def _tensor_to_pil(image_tensor):
+    array = image_tensor.detach().cpu().numpy()
+    array = np.clip(array * 255.0, 0, 255).astype(np.uint8)
+    if array.ndim != 3:
+        raise ValueError("Expected a single IMAGE tensor with shape [H, W, C].")
+    return Image.fromarray(array)
 
-# 这是一个节点，用于设置密码，即使不设置，也有默认密码 123qwe
-class EncryptImage:
-    def __init__(self):
-        self.output_dir = os.path.join(folder_paths.get_output_directory(),'encryptd')
-        self.type = "output"
-        self.prefix_append = ""
-        self.compress_level = 4
+def _pil_to_tensor(image: Image.Image):
+    image = image.convert("RGB")
+    array = np.array(image).astype(np.float32) / 255.0
+    return torch.from_numpy(array).unsqueeze(0)
+
+def _metadata_to_pnginfo(prompt=None, extra_pnginfo=None, additional=None):
+    pnginfo = PngImagePlugin.PngInfo()
+
+    def add_value(key, value):
+        if value is None:
+            return
+        if isinstance(value, bytes):
+            text = value.decode("utf-8", "replace")
+        elif isinstance(value, str):
+            text = value
+        else:
+            text = json.dumps(value, ensure_ascii=False, default=str)
+        pnginfo.add_text(str(key), text)
+
+    if prompt is not None:
+        add_value("prompt", prompt)
+
+    if isinstance(extra_pnginfo, dict):
+        for key, value in extra_pnginfo.items():
+            add_value(key, value)
+
+    if isinstance(additional, dict):
+        for key, value in additional.items():
+            add_value(key, value)
+
+    return pnginfo
+
+def _unique_path(folder, prefix, index):
+    safe_prefix = _sanitize_name(prefix, "Encrypted")
+    stamp = time.strftime("%Y%m%d_%H%M%S")
+    base = f"{safe_prefix}_{stamp}_{index:05d}"
+    filename = f"{base}.png"
+    path = os.path.join(folder, filename)
+    counter = 1
+    while os.path.exists(path):
+        filename = f"{base}_{counter}.png"
+        path = os.path.join(folder, filename)
+        counter += 1
+    return filename, path
+
+class EncryptAndSaveImage:
     @classmethod
-    def INPUT_TYPES(s):
+    def INPUT_TYPES(cls):
         return {
             "required": {
                 "images": ("IMAGE",),
-                "password":  ("STRING", {"default": "123qwe"}),
-                "filename_prefix": ("STRING", {"default": "ComfyUI"}),
-                },
-        "hidden": {"prompt": "PROMPT", "extra_pnginfo": "EXTRA_PNGINFO"},
+                "password": ("STRING", {"default": "", "multiline": False}),
+                "filename_prefix": ("STRING", {"default": "Encrypted"}),
+                "subfolder": ("STRING", {"default": "encrypted"}),
+            },
+            "hidden": {
+                "prompt": "PROMPT",
+                "extra_pnginfo": "EXTRA_PNGINFO",
+            },
         }
-        
-    RETURN_TYPES = ()
-    FUNCTION = 'set_password'
-    
+
+    RETURN_TYPES = ("IMAGE", "STRING")
+    RETURN_NAMES = ("images", "saved_paths")
+    FUNCTION = "execute"
+    CATEGORY = "image"
     OUTPUT_NODE = True
 
-    CATEGORY = "utils"
-    
-    def set_password(self,images,password,filename_prefix="ComfyUI", prompt=None, extra_pnginfo=None):
-        global _password
-        _password = password
-        filename_prefix += self.prefix_append
-        full_output_folder, filename, counter, subfolder, filename_prefix = folder_paths.get_save_image_path(filename_prefix, self.output_dir, images[0].shape[1], images[0].shape[0])
-        results = list()
-        for image in images:
-            i = 255. * image.cpu().numpy()
-            img = Image.fromarray(np.clip(i, 0, 255).astype(np.uint8))
-            metadata = None
-            if not args.disable_metadata:
-                metadata = PngInfo()
-                if prompt is not None:
-                    metadata.add_text("prompt", json.dumps(prompt))
-                if extra_pnginfo is not None:
-                    for x in extra_pnginfo:
-                        metadata.add_text(x, json.dumps(extra_pnginfo[x]))
+    def execute(self, images, password, filename_prefix="Encrypted", subfolder="encrypted", prompt=None, extra_pnginfo=None):
+        output_root = folder_paths.get_output_directory()
+        target_folder = os.path.join(output_root, _sanitize_name(subfolder, "encrypted"))
+        os.makedirs(target_folder, exist_ok=True)
 
-            file = f"{filename}_{counter:05}_.png"
-            img.save(os.path.join(full_output_folder, file), pnginfo=metadata, compress_level=self.compress_level)
-            results.append({
-                "filename": file,
-                "subfolder": os.path.join('encryptd',subfolder),
-                "type": self.type,
-                'channel':'rgb'
-            })
-            counter += 1
+        saved_paths = []
+        preview_images = []
 
-        return { "ui": { "images": results} }
-    
+        for idx in range(images.shape[0]):
+            pil_image = _tensor_to_pil(images[idx])
+            encrypted = encrypt_image_v2(pil_image, password)
+            filename, path = _unique_path(target_folder, filename_prefix, idx)
+            pnginfo = _metadata_to_pnginfo(prompt=prompt, extra_pnginfo=extra_pnginfo)
+            encrypted.save(path, format="PNG", pnginfo=pnginfo)
+            saved_paths.append(path)
+            preview_images.append(_pil_to_tensor(pil_image))
+
+        preview_batch = torch.cat(preview_images, dim=0) if preview_images else images
+        return (preview_batch, "\n".join(saved_paths))
+
+class DecryptImage:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "images": ("IMAGE",),
+                "password": ("STRING", {"default": "", "multiline": False}),
+            }
+        }
+
+    RETURN_TYPES = ("IMAGE",)
+    RETURN_NAMES = ("images",)
+    FUNCTION = "execute"
+    CATEGORY = "image"
+
+    def execute(self, images, password):
+        output = []
+        for idx in range(images.shape[0]):
+            pil_image = _tensor_to_pil(images[idx])
+            decrypted = decrypt_image_v2(pil_image, password)
+            output.append(_pil_to_tensor(decrypted))
+        return (torch.cat(output, dim=0) if output else images,)
+
 NODE_CLASS_MAPPINGS = {
-    "EncryptImage": EncryptImage
+    "EncryptAndSaveImage": EncryptAndSaveImage,
+    "DecryptImage": DecryptImage,
+}
+
+NODE_DISPLAY_NAME_MAPPINGS = {
+    "EncryptAndSaveImage": "Encrypt And Save Image",
+    "DecryptImage": "Decrypt Image",
 }
